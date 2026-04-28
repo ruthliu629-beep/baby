@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>宝宝颜值预测</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Baby Face Forecast</p>
+        <h1>把双人照片变成一份可直接生成宝宝图的 JSON</h1>
+        <p class="hero-text">
+          上传一张或两张人像，网页会调用视觉模型分析可见五官特征，返回你定义好的结构化结果。
+          页面默认严格要求 JSON 输出，方便你继续接图或接后端。
+        </p>
+      </div>
+      <div class="hero-note">
+        <span class="note-chip">严格 JSON</span>
+        <span class="note-chip">支持单图 / 双图</span>
+        <span class="note-chip">可选男宝 / 女宝</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel input-panel">
+        <div class="panel-heading">
+          <h2>上传照片</h2>
+          <p>建议使用正脸、清晰、光线均匀的人像。</p>
+        </div>
+
+        <div class="upload-grid">
+          <label class="upload-card" for="photoA">
+            <input id="photoA" type="file" accept="image/*">
+            <div class="upload-card-inner">
+              <span class="upload-label">照片 A</span>
+              <span class="upload-hint">点击上传或拖拽到这里</span>
+              <img id="previewA" class="preview" alt="照片 A 预览">
+            </div>
+          </label>
+
+          <label class="upload-card" for="photoB">
+            <input id="photoB" type="file" accept="image/*">
+            <div class="upload-card-inner">
+              <span class="upload-label">照片 B（可选）</span>
+              <span class="upload-hint">只传一张时会按单人特征推测</span>
+              <img id="previewB" class="preview" alt="照片 B 预览">
+            </div>
+          </label>
+        </div>
+
+        <div class="controls-grid">
+          <div class="field">
+            <label for="gender">宝宝性别</label>
+            <select id="gender">
+              <option value="">未指定</option>
+              <option value="男宝">男宝</option>
+              <option value="女宝">女宝</option>
+            </select>
+          </div>
+
+          <div class="field field-wide service-status-row">
+            <label>图片服务状态</label>
+            <div id="backendStatus" class="backend-status">正在检查本地配置…</div>
+            <small>图片生成所需密钥只保存在本地后端文件或环境变量中，不会出现在前端页面里。</small>
+          </div>
+
+          <div class="field field-wide">
+            <label for="model">模型</label>
+            <select id="model">
+              <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+              <option value="gpt-4.1">gpt-4.1</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="analyzeBtn" class="primary-btn" type="button">支付 0.99 元并生成</button>
+          <button id="generateBtn" class="secondary-btn" type="button">支付 0.99 元重新生成</button>
+          <button id="demoBtn" class="secondary-btn" type="button">填充示例</button>
+          <button id="copyBtn" class="ghost-btn" type="button">复制 JSON</button>
+          <button id="resetBtn" class="ghost-btn" type="button">清空</button>
+        </div>
+
+        <div id="payPanel" class="pay-panel hidden">
+          <div class="pay-price">支付 ¥0.99 后查看结果</div>
+          <p id="payMessage" class="pay-message">订单创建后，这里会显示支付提示。</p>
+          <div class="pay-actions">
+            <a id="payLink" class="primary-btn pay-link hidden" href="#" target="_blank" rel="noopener noreferrer">打开支付</a>
+            <button id="copyPayLinkBtn" class="ghost-btn" type="button">复制支付链接</button>
+            <button id="checkPayBtn" class="secondary-btn" type="button">我已支付，刷新状态</button>
+            <button id="cancelPayBtn" class="ghost-btn" type="button">取消支付</button>
+          </div>
+        </div>
+
+        <div id="status" class="status">等待上传照片。</div>
+      </section>
+
+      <section class="panel output-panel">
+        <div class="panel-heading">
+          <h2>分析结果与宝宝照片</h2>
+          <p>左侧提交后，这里会同步显示结构化字段、生成提示词和最终宝宝图。</p>
+        </div>
+
+        <div class="baby-image-card">
+          <div class="baby-image-head">
+            <span class="card-kicker">Baby Portrait</span>
+            <a id="downloadImageLink" class="download-link disabled" href="#" download="baby-portrait.jpg">下载照片</a>
+          </div>
+          <div id="imageStage" class="image-stage empty">
+            <div id="imagePlaceholder" class="image-placeholder">
+              <strong>等待生成</strong>
+              <p>点击“开始分析并生成”后，这里会出现宝宝照片。</p>
+            </div>
+            <img id="babyImage" class="baby-image" alt="生成的宝宝照片">
+          </div>
+        </div>
+
+        <div class="result-cards">
+          <article class="result-card">
+            <span class="card-kicker">昵称</span>
+            <h3 id="babyNameView">未生成</h3>
+          </article>
+          <article class="result-card">
+            <span class="card-kicker">遗传亮点</span>
+            <div id="traitsView" class="traits-list">
+              <span class="trait-pill muted-pill">等待结果</span>
+            </div>
+          </article>
+          <article class="result-card">
+            <span class="card-kicker">眼睛</span>
+            <p id="eyesView">等待结果</p>
+          </article>
+          <article class="result-card">
+            <span class="card-kicker">脸型</span>
+            <p id="faceView">等待结果</p>
+          </article>
+          <article class="result-card">
+            <span class="card-kicker">发质</span>
+            <p id="hairView">等待结果</p>
+          </article>
+          <article class="result-card">
+            <span class="card-kicker">气质标签</span>
+            <p id="personalityView">等待结果</p>
+          </article>
+          <article class="result-card prompt-card dev-only">
+            <span class="card-kicker">Image Prompt</span>
+            <p id="promptView">等待结果</p>
+          </article>
+        </div>
+
+        <div class="json-block dev-only">
+          <div class="json-header">
+            <span>Raw JSON</span>
+            <span class="json-badge">schema-locked</span>
+          </div>
+          <pre id="jsonOutput">{
+  "babyName": "",
+  "traits": [],
+  "eyes": "",
+  "face": "",
+  "hair": "",
+  "personality": "",
+  "imagePrompt": ""
+}</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
