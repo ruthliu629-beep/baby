@@ -11,16 +11,14 @@ from server import (
     WECHAT_PAY_AMOUNT_FEN,
     build_order_no,
     build_wechat_h5_order_body,
-    extract_doubao_image_data,
-    extract_provider_error,
     forward_wechat_request,
+    generate_image_from_payload,
+    is_image_service_configured,
     is_wechat_pay_configured,
-    load_doubao_api_key,
-    load_doubao_image_model,
-    load_doubao_image_url,
     load_openai_api_key,
     load_wechat_pay_mchid,
     load_wechat_pay_return_url,
+    extract_provider_error,
 )
 from server import AppHandler as LocalAppHandler
 
@@ -62,27 +60,9 @@ def forward_openai_request(upstream_request: dict) -> tuple[int, dict]:
     )
 
 
-def forward_image_request(prompt: str) -> tuple[int, dict]:
-    handler = make_local_handler()
-    image_request = {
-        "model": load_doubao_image_model(),
-        "prompt": prompt,
-        "sequential_image_generation": "disabled",
-        "response_format": "b64_json",
-        "size": "2048x2048",
-        "stream": False,
-        "watermark": True,
-    }
-    return handler._forward_json_request(  # noqa: SLF001
-        url=load_doubao_image_url(),
-        api_key=load_doubao_api_key(),
-        payload=image_request,
-    )
-
-
 @app.get("/api/config-status")
 def config_status():
-    image_ready = bool(load_doubao_api_key())
+    image_ready = is_image_service_configured()
     analysis_ready = bool(load_openai_api_key())
     payment_ready = is_wechat_pay_configured()
 
@@ -130,18 +110,8 @@ def generate_image():
     if not isinstance(payload, dict):
         return json_response({"error": {"message": "请求体不是合法 JSON。"}}, HTTPStatus.BAD_REQUEST)
 
-    prompt = str(payload.get("prompt") or "").strip()
-    if not load_doubao_api_key():
-        return json_response({"error": {"message": "后端未配置图片服务 API Key。"}}, HTTPStatus.BAD_REQUEST)
-
-    if not prompt:
-        return json_response({"error": {"message": "缺少图片生成 prompt。"}}, HTTPStatus.BAD_REQUEST)
-
-    status, parsed = forward_image_request(prompt)
-    if status == HTTPStatus.OK and not extract_doubao_image_data(parsed):
-        message = extract_provider_error(parsed, default_message="图片服务返回了空结果。")
-        return json_response({"error": {"message": message}}, HTTPStatus.BAD_GATEWAY)
-
+    handler = make_local_handler()
+    status, parsed = generate_image_from_payload(payload, handler._forward_json_request)  # noqa: SLF001
     return json_response(parsed, status)
 
 

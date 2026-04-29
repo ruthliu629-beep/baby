@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import sys
@@ -16,6 +17,12 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from PIL import Image, ImageOps
+
+try:
+    from volcengine.imagex.v2.imagex_service import ImagexService
+except ImportError:  # pragma: no cover - optional dependency during local bootstrap
+    ImagexService = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,10 +31,16 @@ PORT = int(os.environ.get("PORT", "4173"))
 OPENAI_URL = "https://api.openai.com/v1/responses"
 DOUBAO_IMAGE_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 DEFAULT_DOUBAO_IMAGE_MODEL = "doubao-seedream-5-0-260128"
+DEFAULT_VEIMAGEX_REGION = "cn-north-1"
+DEFAULT_VEIMAGEX_MODEL_ACTION = "Img2ImgXLSft"
+DEFAULT_VEIMAGEX_MODEL_VERSION = "2022-08-31"
+DEFAULT_VEIMAGEX_REQ_KEY = "i2i_xl_sft"
 SECRETS_FILE = ROOT / "secrets.local.json"
 WECHAT_PAY_BASE_URL = "https://api.mch.weixin.qq.com"
 WECHAT_PAY_CREATE_URL = f"{WECHAT_PAY_BASE_URL}/v3/pay/transactions/h5"
 WECHAT_PAY_AMOUNT_FEN = 99
+REFERENCE_UPLOAD_PREFIX = "baby-reference"
+LANCZOS = Image.Resampling.LANCZOS
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -63,7 +76,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def handle_config_status(self) -> None:
-        image_ready = bool(load_doubao_api_key())
+        image_ready = is_image_service_configured()
         analysis_ready = bool(load_openai_api_key())
         payment_ready = is_wechat_pay_configured()
 
@@ -124,49 +137,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         if payload is None:
             return
 
-        prompt = str(payload.get("prompt") or "").strip()
-        api_key = load_doubao_api_key()
-        model_name = load_doubao_image_model()
-
-        if not api_key:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": "后端未配置图片服务 API Key。"}},
-            )
-            return
-
-        if not prompt:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": "缺少图片生成 prompt。"}},
-            )
-            return
-
-        image_request = {
-            "model": model_name,
-            "prompt": prompt,
-            "sequential_image_generation": "disabled",
-            "response_format": "b64_json",
-            "size": "2048x2048",
-            "stream": False,
-            "watermark": True,
-        }
-
-        status, parsed = self._forward_json_request(
-            url=load_doubao_image_url(),
-            api_key=api_key,
-            payload=image_request,
-        )
-
-        if status == HTTPStatus.OK:
-            image_data = extract_doubao_image_data(parsed)
-            if not image_data:
-                message = extract_provider_error(parsed, default_message="图片服务返回了空结果。")
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": {"message": message}})
-                return
-        elif status >= HTTPStatus.BAD_REQUEST:
-            print(f"Image provider error {status}: {extract_provider_error(parsed)}", flush=True)
-
+        status, parsed = generate_image_from_payload(payload, self._forward_json_request)
         self._send_json(status, parsed)
 
     def handle_payment_create(self) -> None:
@@ -400,6 +371,42 @@ def load_doubao_image_url() -> str:
     return _load_secret("doubao_image_url") or DOUBAO_IMAGE_URL
 
 
+def load_veimagex_ak() -> str:
+    return _load_secret("veimagex_ak")
+
+
+def load_veimagex_sk() -> str:
+    return _load_secret("veimagex_sk")
+
+
+def load_veimagex_service_id() -> str:
+    return _load_secret("veimagex_service_id")
+
+
+def load_veimagex_domain() -> str:
+    return _load_secret("veimagex_domain")
+
+
+def load_veimagex_template() -> str:
+    return _load_secret("veimagex_template")
+
+
+def load_veimagex_region() -> str:
+    return _load_secret("veimagex_region") or DEFAULT_VEIMAGEX_REGION
+
+
+def load_veimagex_model_action() -> str:
+    return _load_secret("veimagex_model_action") or DEFAULT_VEIMAGEX_MODEL_ACTION
+
+
+def load_veimagex_model_version() -> str:
+    return _load_secret("veimagex_model_version") or DEFAULT_VEIMAGEX_MODEL_VERSION
+
+
+def load_veimagex_req_key() -> str:
+    return _load_secret("veimagex_req_key") or DEFAULT_VEIMAGEX_REQ_KEY
+
+
 def load_wechat_pay_mchid() -> str:
     return _load_secret("wechat_pay_mchid")
 
@@ -454,6 +461,21 @@ def is_wechat_pay_configured() -> bool:
         return False
 
     return bool(private_key_path and private_key_path.exists() and private_key_path.is_file())
+
+
+def is_veimagex_configured() -> bool:
+    required_values = [
+        load_veimagex_ak(),
+        load_veimagex_sk(),
+        load_veimagex_service_id(),
+        load_veimagex_domain(),
+        load_veimagex_template(),
+    ]
+    return bool(ImagexService and all(required_values))
+
+
+def is_image_service_configured() -> bool:
+    return is_veimagex_configured() or bool(load_doubao_api_key())
 
 
 def build_order_no(action: str) -> str:
@@ -568,6 +590,213 @@ def forward_wechat_request(*, method: str, path: str, payload: dict | None) -> t
         return status, json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError:
         return HTTPStatus.BAD_GATEWAY, {"error": {"message": "微信支付返回了不可解析的响应。"}}
+
+
+def generate_image_from_payload(
+    payload: dict,
+    forward_json_request,
+) -> tuple[int, dict]:
+    prompt = str(payload.get("prompt") or "").strip()
+    baby_name = str(payload.get("babyName") or "宝宝").strip() or "宝宝"
+    source_images = extract_source_images(payload)
+
+    if not is_image_service_configured():
+        return HTTPStatus.BAD_REQUEST, {"error": {"message": "后端未配置图片服务。"}}
+
+    if not prompt:
+        return HTTPStatus.BAD_REQUEST, {"error": {"message": "缺少图片生成 prompt。"}}
+
+    if is_veimagex_configured() and source_images:
+        try:
+            return generate_with_veimagex(prompt=prompt, baby_name=baby_name, source_images=source_images)
+        except Exception as exc:  # noqa: BLE001
+            print("veImageX generation exception:", repr(exc), flush=True)
+            traceback.print_exc()
+            if not load_doubao_api_key():
+                return HTTPStatus.BAD_GATEWAY, {"error": {"message": f"veImageX 图生图失败：{exc}"}}  # noqa: EM102
+
+    if not load_doubao_api_key():
+        return HTTPStatus.BAD_REQUEST, {"error": {"message": "图片服务未配置可用的回退模型。"}}
+
+    image_request = {
+        "model": load_doubao_image_model(),
+        "prompt": prompt,
+        "sequential_image_generation": "disabled",
+        "response_format": "b64_json",
+        "size": "2048x2048",
+        "stream": False,
+        "watermark": True,
+    }
+
+    status, parsed = forward_json_request(
+        url=load_doubao_image_url(),
+        api_key=load_doubao_api_key(),
+        payload=image_request,
+    )
+
+    if status == HTTPStatus.OK:
+        image_data = extract_doubao_image_data(parsed)
+        if not image_data:
+            message = extract_provider_error(parsed, default_message="图片服务返回了空结果。")
+            return HTTPStatus.BAD_GATEWAY, {"error": {"message": message}}
+    elif status >= HTTPStatus.BAD_REQUEST:
+        print(f"Image provider error {status}: {extract_provider_error(parsed)}", flush=True)
+
+    return status, parsed
+
+
+def extract_source_images(payload: dict) -> list[str]:
+    raw_items = payload.get("sourceImages")
+    if not isinstance(raw_items, list):
+        return []
+
+    source_images: list[str] = []
+    for item in raw_items[:2]:
+        if isinstance(item, dict):
+            data_url = str(item.get("dataUrl") or "").strip()
+        else:
+            data_url = str(item or "").strip()
+
+        if data_url.startswith("data:image/"):
+            source_images.append(data_url)
+
+    return source_images
+
+
+def generate_with_veimagex(*, prompt: str, baby_name: str, source_images: list[str]) -> tuple[int, dict]:
+    reference_bytes = build_reference_image_bytes(source_images)
+    store_key = upload_reference_image_to_veimagex(reference_bytes)
+    reference_url = build_veimagex_reference_url(store_key)
+    client = build_veimagex_client()
+
+    body = {
+        "Domain": load_veimagex_domain(),
+        "Template": load_veimagex_template(),
+        "ModelAction": load_veimagex_model_action(),
+        "ModelVersion": load_veimagex_model_version(),
+        "ImageUrl": reference_url,
+        "Outputs": [build_veimagex_output_name(baby_name)],
+        "Overwrite": True,
+        "ReqJson": {
+            "req_key": load_veimagex_req_key(),
+            "prompt": prompt,
+            "image_urls": [reference_url],
+        },
+    }
+
+    response = client.get_cv_image_generate_result(
+        {"ServiceId": load_veimagex_service_id()},
+        body,
+    )
+
+    image_url = extract_veimagex_output_url(response)
+    if not image_url:
+        raise RuntimeError("veImageX 已返回成功，但没有拿到图片地址。")
+
+    return HTTPStatus.OK, {
+        "provider": "veimagex",
+        "data": [{"url": image_url}],
+        "raw": response,
+    }
+
+
+def build_veimagex_client():
+    if not ImagexService:
+        raise RuntimeError("未安装 volcengine Python SDK。")
+
+    return ImagexService(
+        {
+            "ak": load_veimagex_ak(),
+            "sk": load_veimagex_sk(),
+            "region": load_veimagex_region(),
+        }
+    )
+
+
+def build_reference_image_bytes(source_images: list[str]) -> bytes:
+    images = [open_source_image(data_url) for data_url in source_images[:2]]
+    if not images:
+        raise RuntimeError("veImageX 图生图至少需要一张参考图。")
+
+    if len(images) == 1:
+        canvas = ImageOps.fit(images[0], (1024, 1024), LANCZOS)
+    else:
+        canvas = Image.new("RGB", (2048, 1024), "white")
+        left = ImageOps.fit(images[0], (960, 960), LANCZOS)
+        right = ImageOps.fit(images[1], (960, 960), LANCZOS)
+        canvas.paste(left, (32, 32))
+        canvas.paste(right, (1056, 32))
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=92, optimize=True)
+    return output.getvalue()
+
+
+def open_source_image(data_url: str) -> Image.Image:
+    raw_bytes = decode_data_url(data_url)
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
+
+
+def decode_data_url(data_url: str) -> bytes:
+    prefix, separator, encoded = data_url.partition(",")
+    if not separator or ";base64" not in prefix:
+        raise RuntimeError("参考图数据格式不正确。")
+    return base64.b64decode(encoded)
+
+
+def upload_reference_image_to_veimagex(image_bytes: bytes) -> str:
+    store_key = build_reference_store_key()
+    client = build_veimagex_client()
+    client.upload_image_data(
+        {
+            "ServiceId": load_veimagex_service_id(),
+            "StoreKeys": [store_key],
+            "Overwrite": True,
+        },
+        [image_bytes],
+    )
+    return store_key
+
+
+def build_reference_store_key() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"{REFERENCE_UPLOAD_PREFIX}/{timestamp}-{uuid.uuid4().hex[:10]}.jpg"
+
+
+def build_veimagex_reference_url(store_key: str) -> str:
+    normalized_domain = load_veimagex_domain().strip().rstrip("/")
+    safe_key = "/".join(quote(part, safe="._-~") for part in store_key.split("/"))
+    return f"https://{normalized_domain}/{safe_key}"
+
+
+def build_veimagex_output_name(baby_name: str) -> str:
+    slug = "".join(ch for ch in baby_name if ch.isalnum()) or "baby"
+    return f"{slug}-{uuid.uuid4().hex[:8]}.jpg"
+
+
+def extract_veimagex_output_url(payload: dict) -> str:
+    result = payload.get("Result")
+    if not isinstance(result, dict):
+        return ""
+
+    for key in ("ImageUrls", "OutputImageUrls", "ImageURL"):
+        value = result.get(key)
+        if isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+            if isinstance(first, dict):
+                for subkey in ("Url", "URL", "ImageUrl", "OutputUrl"):
+                    candidate = str(first.get(subkey, "")).strip()
+                    if candidate:
+                        return candidate
+
+    for key in ("ImageUrl", "OutputUrl", "Url"):
+        candidate = str(result.get(key, "")).strip()
+        if candidate:
+            return candidate
+
+    return ""
 
 
 def extract_doubao_image_data(payload: dict) -> str:

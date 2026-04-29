@@ -562,6 +562,13 @@ async function generateBabyPhoto(result = latestResult) {
   setStatus("分析结果已完成，正在根据证件照要求生成宝宝照片...", "busy");
 
   try {
+    const sourceImages = [imageStore.a, imageStore.b]
+      .filter(Boolean)
+      .map((item) => ({
+        name: item.name || "",
+        dataUrl: item.dataUrl,
+      }));
+
     const response = await fetch("/api/generate-image", {
       method: "POST",
       headers: {
@@ -570,6 +577,7 @@ async function generateBabyPhoto(result = latestResult) {
       body: JSON.stringify({
         prompt: buildIdPhotoPrompt(result.imagePrompt),
         babyName: result.babyName || "宝宝",
+        sourceImages,
       }),
     });
 
